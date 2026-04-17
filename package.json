@@ -1,0 +1,30 @@
+{
+  "name": "auto-attendance",
+  "version": "2.0.0",
+  "description": "Sistema de Atendimento Automatizado com IA e WhatsApp",
+  "type": "module",
+  "scripts": {
+    "dev": "node --watch server.js",
+    "start": "node server.js",
+    "db:migrate": "node database/migrate.js",
+    "db:setup": "docker compose up -d postgres redis && timeout 5 && node database/migrate.js",
+    "docker:up": "docker compose up -d",
+    "docker:down": "docker compose down"
+  },
+  "dependencies": {
+    "@opencode-ai/sdk": "^1.4.3",
+    "axios": "^1.7.2",
+    "better-sqlite3": "^11.0.0",
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.5",
+    "express": "^4.21.0",
+    "multer": "^1.4.5-lts.1",
+    "openai": "^6.34.0",
+    "pg": "^8.20.0",
+    "pino": "^8.19.0",
+    "pino-pretty": "^10.3.1",
+    "qrcode": "^1.5.3",
+    "socket.io": "^4.7.5",
+    "uuid": "^9.0.1"
+  }
+}
