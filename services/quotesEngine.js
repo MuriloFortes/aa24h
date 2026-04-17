@@ -941,17 +941,44 @@ export class QuotesEngine {
    * @returns {{ handled: boolean }}
    */
   async handleClientQuoteConfirmation(phone, text) {
+    logger.info({ phone, text, clientConfirmMapSize: this.clientConfirmByPhone.size }, "handleClientQuoteConfirmation: INÍCIO");
+    const isWebSession = /^web[_-]/i.test(String(phone || ""));
     const norm = this._normClientKey(phone);
     let roundId = this.clientConfirmByPhone.get(norm);
+    logger.info({ norm, roundIdFromMap: !!roundId }, "handleClientQuoteConfirmation: buscando no mapa");
     if (!roundId) {
       roundId = this.clientConfirmByPhone.get(this._normPhone(phone));
     }
-    if (!roundId) return { handled: false };
-    const state = this.activeRounds.get(roundId);
-    if (!state || !state.awaitingClientConfirm || !state.clientOfferSent || !state.pendingWinner) {
+    // Para sessão web (web_*), buscar pela chave do telefone real do cliente nos rounds ativos
+    if (!roundId && isWebSession) {
+      logger.info({ activeRounds: this.activeRounds.size }, "handleClientQuoteConfirmation: verificando rounds ativos para web");
+      for (const [rid, st] of this.activeRounds) {
+        logger.info({ roundId: rid, awaitingConfirm: st.awaitingClientConfirm, offerSent: st.clientOfferSent, winner: !!st.pendingWinner }, "handleClientQuoteConfiguration: round ativo");
+        if (st.awaitingClientConfirm && st.clientOfferSent && st.pendingWinner) {
+          const ticketPhone = this._normClientKey(st.ticket.phoneNumber);
+          logger.info({ ticketPhone, phoneSlice: this._normPhone(phone).slice(-8), ticketPhoneSlice: this._normPhone(ticketPhone || "").slice(-8) }, "comparando telefones");
+          if (ticketPhone && this._normPhone(phone).endsWith(this._normPhone(ticketPhone).slice(-8))) {
+            roundId = rid;
+            logger.info({ roundId }, "handleClientQuoteConfirmation: round encontrado para web");
+            break;
+          }
+        }
+      }
+    }
+    if (!roundId) {
+      logger.warn({ phone, norm, isWebSession, activeRoundsSize: this.activeRounds.size, confirmMapKeys: [...this.clientConfirmByPhone.keys()] }, "handleClientQuoteConfirmation: round NÃO encontrado");
       return { handled: false };
     }
-    if (!this._isClientConfirmText(text)) return { handled: false };
+    const state = this.activeRounds.get(roundId);
+    if (!state || !state.awaitingClientConfirm || !state.clientOfferSent || !state.pendingWinner) {
+      logger.warn({ roundId, stateExists: !!state, awaitingConfirm: state?.awaitingClientConfirm, offerSent: state?.clientOfferSent, winner: !!state?.pendingWinner }, "handleClientQuoteConfirmation: estado inválido");
+      return { handled: false };
+    }
+    if (!this._isClientConfirmText(text)) {
+      logger.warn({ text }, "handleClientQuoteConfirmation: texto não reconhecido como confirmação");
+      return { handled: false };
+    }
+    logger.info({ roundId, winner: state.pendingWinner?.name }, "handleClientQuoteConfirmation: CONFIRMANDO - chamand o_finalize");
     this.clientConfirmByPhone.delete(norm);
     this.clientConfirmByPhone.delete(this._normPhone(phone));
     if (state.clientResponseDeadlineHandle) {
@@ -1158,11 +1185,47 @@ export class QuotesEngine {
       attKmRow?.distance_km != null && Number.isFinite(Number(attKmRow.distance_km))
         ? Number(attKmRow.distance_km)
         : null;
-    const routeKmStr = routeKm != null ? routeKm.toFixed(1) : null;
+const routeKmStr = routeKm != null ? routeKm.toFixed(1) : null;
 
+    logger.info({ winnerPhone: winner.whatsapp || winner.phone, clientPhone: state.ticket.phoneNumber, billingMode }, "_finalize: iniciando envio de mensagens");
     (async () => {
       const winnerPhone = winner.whatsapp || winner.phone;
       if (winnerPhone) {
+        logger.info({ winnerPhone }, "_finalize: enviando mensagem ao PRESTADOR");
+        try {
+          if (billingMode === "prepay_non_associate") {
+            await this.sendMessage(
+              winnerPhone,
+              `✅ *Liberação de saída — melhor custo-benefício*\n\n` +
+                `Você foi selecionado neste atendimento. Pode *iniciar o deslocamento*.\n` +
+                `💰 R$ ${Number(winner.price).toFixed(2)} · ⏱️ ${winner.etaMinutes} min.\n` +
+                (routeKmStr ? `📏 Trajeto (origem → destino): *${routeKmStr} km*\n` : "") +
+                `📋 Cliente: ${state.ticket.customerName || "—"}\n` +
+                `📍 Origem: ${state.ticket.location || "—"}\n` +
+                `📍 Destino: ${state.ticket.destination || "—"}\n` +
+                `🚗 Placa: ${state.ticket.vehiclePlate || "—"}\n\n` +
+                `📸 Quando o veículo estiver *no reboque*, envie *fotos* aqui.\n` +
+                `Em seguida envie sua *chave PIX* para repassarmos ao financeiro.`
+            );
+          } else {
+            await this.sendMessage(
+              winnerPhone,
+              `✅ *Proposta aceita!* Serviço confirmado com você.\n` +
+                `💰 R$ ${Number(winner.price).toFixed(2)} · ⏱️ ${winner.etaMinutes} min.\n` +
+                (routeKmStr ? `📏 Trajeto do serviço (origem → destino): *${routeKmStr} km*\n` : "") +
+                `📋 Cliente: ${state.ticket.customerName || "—"}\n` +
+                `📍 Origem: ${state.ticket.location || "—"}\n` +
+                `📍 Destino: ${state.ticket.destination || "—"}\n` +
+                `🚗 Placa: ${state.ticket.vehiclePlate || "—"}`
+            );
+          }
+        } catch (e) {
+          logger.error({ e, winnerPhone }, "_finalize: ERRO ao enviar mensagem ao prestador");
+        }
+      }
+      const clientPhone = state.ticket.phoneNumber;
+      if (clientPhone) {
+        logger.info({ clientPhone }, "_finalize: enviando mensagem ao CLIENTE");
         try {
           if (billingMode === "prepay_non_associate") {
             await this.sendMessage(
@@ -1441,6 +1504,25 @@ export class QuotesEngine {
     for (const state of this.activeRounds.values()) {
       if (state.finalized) continue;
       if (this._findProviderMetaForInbound(state, providerPhone, null)) return true;
+    }
+    return false;
+  }
+
+  hasActiveRoundForClient(clientPhone) {
+    const isWebSession = /^web[_-]/i.test(String(clientPhone || ""));
+    const norm = this._normClientKey(clientPhone);
+    // Verifica diretamente no mapa
+    if (this.clientConfirmByPhone.has(norm)) return true;
+    if (this.clientConfirmByPhone.has(this._normPhone(clientPhone))) return true;
+    // Para sessão web, verificar pelo telefone do ticket em cada round
+    if (isWebSession) {
+      for (const state of this.activeRounds.values()) {
+        if (state.finalized || !state.awaitingClientConfirm) continue;
+        const ticketPhone = this._normClientKey(state.ticket.phoneNumber);
+        if (ticketPhone && this._normPhone(clientPhone).endsWith(this._normPhone(ticketPhone).slice(-8))) {
+          return true;
+        }
+      }
     }
     return false;
   }

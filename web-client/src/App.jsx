@@ -4177,6 +4177,22 @@ function SettingsGeneralSection() {
         />
       </div>
 
+      <div className="border-t border-slate-700 my-4"></div>
+
+      <div>
+        <label className="block text-sm text-slate-300 mb-1">Mercado Pago (Access Token)</label>
+        <p className="text-xs text-slate-500 mb-2">
+          Token da API do Mercado Pago para gerar links de pagamento. Gere em: Configurações → Lojas e caixas → Criar loja → Access Token.
+        </p>
+        <input
+          type="password"
+          value={settings.mercadopago_access_token || ""}
+          onChange={(e) => setSettings({ ...settings, mercadopago_access_token: e.target.value })}
+          className="w-full bg-slate-900 border border-slate-700 rounded-lg px-4 py-2 text-sm font-mono focus:outline-none focus:border-[color:var(--color-primary)] ring-primary"
+          placeholder="APP_USR-xxxxxxxxxxxx-xxxxxxxxxxxx-xxxxxxxxxxxxxxxxxxxxx"
+        />
+      </div>
+
       <div className="flex items-center gap-3 pt-2">
         <button type="button" onClick={save} className="px-6 py-2 btn-primary text-sm">
           Salvar alterações

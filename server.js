@@ -416,6 +416,17 @@ function runSchema() {
       created_at TEXT NOT NULL DEFAULT (datetime('now'))
     );
 
+    CREATE TABLE IF NOT EXISTS payment_links (
+      id TEXT PRIMARY KEY,
+      attendance_id TEXT NOT NULL,
+      mp_payment_id TEXT,
+      amount REAL NOT NULL,
+      status TEXT NOT NULL DEFAULT 'pending',
+      payment_url TEXT,
+      qr_code TEXT,
+      created_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+
     CREATE TABLE IF NOT EXISTS audit_logs (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       event_type TEXT NOT NULL,
@@ -624,6 +635,122 @@ app.post("/api/settings/batch", (req, res) => {
     db.prepare("INSERT OR REPLACE INTO settings (key, value, updated_at) VALUES (?, ?, datetime('now'))").run(key, value);
   }
   res.json({ success: true });
+});
+
+// ============================================
+// MERCADO PAGO - Criar link de pagamento
+// ============================================
+app.post("/api/payment/create-link", async (req, res) => {
+  const { attendanceId, amount, description, clientName } = req.body;
+  if (!attendanceId || !amount) {
+    return res.status(400).json({ error: "attendanceId e amount são obrigatórios" });
+  }
+
+  if (!paymentService.isConfigured()) {
+    return res.status(503).json({ error: "Mercado Pago não configurado. Defina MERCADOPAGO_ACCESS_TOKEN no .env" });
+  }
+
+  try {
+    const result = await paymentService.createPaymentLink({
+      attendanceId,
+      amount,
+      description: description || "Serviço de reboque",
+      providerName: clientName,
+    });
+
+    // Atualizar attendance com payment_link
+    const paymentUrl = result.ticketUrl || result.pointOfInteractionUrl;
+    if (paymentUrl) {
+      db.prepare("UPDATE attendances SET payment_link = ? WHERE id = ?").run(paymentUrl, attendanceId);
+    }
+
+    res.json({
+      success: true,
+      paymentId: result.paymentId,
+      paymentUrl,
+      status: result.status,
+    });
+  } catch (err) {
+    logger.error({ err, attendanceId }, "Erro ao criar payment link");
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Verificar status do pagamento
+app.get("/api/payment/status/:attendanceId", async (req, res) => {
+  const { attendanceId } = req.params;
+  if (!paymentService.isConfigured()) {
+    return res.status(503).json({ error: "Mercado Pago não configurado" });
+  }
+
+  try {
+    const row = db.prepare("SELECT payment_link, mp_payment_id FROM payment_links WHERE attendance_id = ?").get(attendanceId);
+    if (!row?.mp_payment_id) {
+      return res.json({ status: "not_found" });
+    }
+
+    const result = await paymentService.checkPaymentStatus(row.mp_payment_id);
+
+    // Atualizar status local se mudou
+    if (result.status !== row.status) {
+      db.prepare("UPDATE payment_links SET status = ? WHERE attendance_id = ?").run(result.status, attendanceId);
+    }
+
+    res.json(result);
+  } catch (err) {
+    logger.error({ err, attendanceId }, "Erro ao verificar pagamento");
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Webhook do Mercado Pago
+app.post("/api/payment/webhook", async (req, res) => {
+  const { type, data } = req.body;
+  if (type !== "payment") {
+    return res.json({ received: true });
+  }
+
+  const paymentId = data?.id;
+  if (!paymentId) {
+    return res.json({ received: true });
+  }
+
+  try {
+    const status = req.body?.notification_type === "payment_created"
+      ? "pending"
+      : req.body?.status || "unknown";
+
+    // Atualizar no banco
+    db.prepare("UPDATE payment_links SET status = ? WHERE mp_payment_id = ?").run(status, paymentId);
+
+    // Buscar attendance para notificar
+    const row = db.prepare("SELECT attendance_id FROM payment_links WHERE mp_payment_id = ?").get(paymentId);
+    if (row?.attendance_id) {
+      // Se pago aprovado, liberar prestador
+      if (status === "approved") {
+        db.prepare("UPDATE attendances SET status = 'in_progress', payment_status = 'paid' WHERE id = ?").run(row.attendance_id);
+
+        // Notificar prestador
+        const att = db.prepare("SELECT provider_phone FROM attendances WHERE id = ?").get(row.attendance_id);
+        if (att?.provider_phone) {
+          try {
+            await sendEvolutionMessage(att.provider_phone, "✅ Pagamento confirmado! Você pode iniciar o deslocamento.");
+          } catch (e) {}
+        }
+
+        // Notificar gestor
+        try {
+          await notifyGestor(`💳 Pagamento confirmado para atendimento ${row.attendance_id.slice(0, 8)}`);
+        } catch (e) {}
+      }
+    }
+
+    logger.info({ paymentId, status }, "Webhook Mercado Pago processado");
+    res.json({ received: true });
+  } catch (err) {
+    logger.error({ err }, "Erro no webhook Mercado Pago");
+    res.status(500).json({ error: "Erro interno" });
+  }
 });
 
 app.get("/api/statistics", (req, res) => {
@@ -1744,12 +1871,26 @@ app.post("/api/chat/web", async (req, res) => {
 
     const quoteConfirm = await orchestrator.handleClientQuoteConfirmation(sessionId, message);
     if (quoteConfirm?.handled) {
+      conversationManager.addMessage(sessionId, "user", message);
+      conversationManager.addMessage(sessionId, "assistant", "✅ Proposta confirmada. Estamos liberando o prestador e enviando as instruções por WhatsApp.");
       const session = conversationManager.getSession(sessionId);
       return res.json({
         response:
           "✅ Proposta confirmada. Estamos liberando o prestador e enviando as instruções por WhatsApp.",
         state: session?.state,
         collectedData: session?.collectedData,
+        simulated: false,
+        handled: true,
+      });
+    }
+
+    // Se já existe round ativo para esta sessão (cliente aguardando confirmação), não criar novo atendimento
+    const sess = conversationManager.getSession(sessionId);
+    if (orchestrator.quotesEngine?.hasActiveRoundForClient(sessionId)) {
+      return res.json({
+        response: "Já temos uma cotação em andamento. Aguarde as propostas dos prestadores.",
+        state: sess?.state,
+        collectedData: sess?.collectedData,
         simulated: false,
       });
     }
