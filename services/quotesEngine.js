@@ -1255,7 +1255,6 @@ const routeKmStr = routeKm != null ? routeKm.toFixed(1) : null;
           }
         } catch {}
       }
-      const clientPhone = state.ticket.phoneNumber;
       if (clientPhone) {
         try {
           if (billingMode === "prepay_non_associate") {

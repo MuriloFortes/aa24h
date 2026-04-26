@@ -13,6 +13,17 @@ import { logger } from "./lib/logger.js";
 import axios from "axios";
 import { processMessage, hasLLMConfigured } from "./agents/attendant.js";
 import { conversationManager, STATES } from "./agents/conversationFlow.js";
+import {
+  handleVoiceCall,
+  handleVoiceGather,
+  startVoiceCall,
+  getVoiceSessionState,
+  hasVoxtralConfigured,
+  hasTwilioConfigured,
+  buildTwilioVoiceResponse,
+  buildTwilioGatherResponse,
+  buildTwilioHangupResponse,
+} from "./services/voiceAttendant.js";
 import { Orchestrator } from "./agents/orchestrator.js";
 import { Analyst } from "./agents/analyst.js";
 import { PaymentService } from "./services/payment.js";
@@ -284,7 +295,15 @@ const notificationService = new NotificationService(io, sendEvolutionMessage);
 
 app.use(cors());
 app.use(express.json({ limit: "10mb" }));
-app.use(express.urlencoded({ extended: true }));
+app.use(express.urlencoded({ extended: true, limit: "10mb" }));
+
+app.use((req, res, next) => {
+  if (req.path.startsWith("/api/voice")) {
+    logger.info({ method: req.method, path: req.path, body: req.body, contentType: req.get("Content-Type") }, "Voice request");
+  }
+  next();
+});
+
 app.use("/audio", express.static(path.join(__dirname, "audio")));
 app.use("/providers-photos", express.static(path.join(__dirname, "providers-photos")));
 
@@ -2290,6 +2309,124 @@ app.get("/api/audit-logs", (req, res) => {
   }
 });
 
+// ============================================
+// TELEFONE - Twilio + Voxtral Voice Webhooks
+// ============================================
+
+app.post("/api/voice/inbound", async (req, res) => {
+  if (!hasTwilioConfigured() || !hasVoxtralConfigured()) {
+    return res.status(503).send("Serviço de voz não configurado");
+  }
+
+  logger.info({ body: req.body, query: req.query }, "Voice inbound received");
+
+  const CallSid = req.body.CallSid || req.query.CallSid;
+  const From = req.body.From || req.query.From;
+  const To = req.body.To || req.query.To;
+  const CallStatus = req.body.CallStatus || req.query.CallStatus || "ringing";
+
+  logger.info({ CallSid, From, To, CallStatus }, "Voice processing");
+
+  try {
+    if (!CallStatus || CallStatus === "ringing" || CallStatus === "initiated" || CallStatus === "in-progress") {
+      const result = await startVoiceCall(CallSid, From);
+      if (result.error) {
+        const twiml = '<?xml version="1.0" encoding="UTF-8"?><Response><Say>Erro ao iniciar atendimento. Tente novamente.</Say></Response>';
+        return res.type("text/xml").send(twiml);
+      }
+      return res.type("text/xml").send(result.response);
+    }
+
+    const result = await handleVoiceCall(CallSid, From, To, CallStatus);
+    return res.json(result);
+  } catch (error) {
+    logger.error({ error: error.message }, "Voice inbound error");
+    const twiml = '<?xml version="1.0" encoding="UTF-8"?><Response><Say>Erro interno. Tente novamente.</Say></Response>';
+    return res.type("text/xml").send(twiml);
+  }
+});
+
+app.get("/api/voice/inbound", async (req, res) => {
+  return res.type("text/xml").send('<?xml version="1.0" encoding="UTF-8"?><Response><Say>Voice service working. Call this endpoint via POST.</Say></Response>');
+});
+
+app.all("/api/voice/test", (req, res) => {
+  logger.info({ method: req.method, headers: req.headers, body: req.body, query: req.query }, "Voice test received");
+  res.json({ received: { method: req.method, body: req.body, query: req.query } });
+});
+
+app.post("/api/voice/gather", async (req, res) => {
+  if (!hasTwilioConfigured() || !hasVoxtralConfigured()) {
+    return res.status(503).send("Serviço de voz não configurado");
+  }
+
+  const { CallSid, From, RecordingUrl, SpeechResult, Digits } = req.body;
+
+  try {
+    const audioUrl = RecordingUrl || null;
+    const userText = SpeechResult || Digits || "";
+
+    const result = await handleVoiceCall(CallSid, From, null, "in-progress");
+
+    if (result.error) {
+      const response = await buildTwilioGatherResponse(
+        "Não foi possível identificar sua ligação. Por favor, tente novamente."
+      );
+      return res.type("text/xml").send(response);
+    }
+
+    const gatherResult = await handleVoiceGather(CallSid, From, audioUrl, userText);
+
+    if (gatherResult.error) {
+      const response = await buildTwilioGatherResponse(
+        "Desculpe, não entendi. Por favor, repita."
+      );
+      return res.type("text/xml").send(response);
+    }
+
+    return res.type("text/xml").send(gatherResult.response);
+  } catch (error) {
+    logger.error({ error: error.message }, "Voice gather error");
+    const response = await buildTwilioHangupResponse(
+      "Desculpe, ocorreu um erro. Nossa equipe entrará em contato pelo WhatsApp. Goodbye!"
+    );
+    return res.type("text/xml").send(response);
+  }
+});
+
+app.post("/api/voice/callback", async (req, res) => {
+  if (!hasTwilioConfigured()) {
+    return res.status(503).send("Twilio não configurado");
+  }
+
+  const { CallSid, CallStatus, Duration } = req.body;
+
+  try {
+    await handleVoiceCall(CallSid, null, null, CallStatus);
+    return res.json({ status: "ok" });
+  } catch (error) {
+    logger.error({ error: error.message }, "Voice callback error");
+    return res.status(500).send("Erro interno");
+  }
+});
+
+app.get("/api/voice/status", (req, res) => {
+  const { phone } = req.query;
+  const session = phone ? getVoiceSessionState(phone) : null;
+  res.json({
+    configured: hasTwilioConfigured() && hasVoxtralConfigured(),
+    twilio: hasTwilioConfigured(),
+    voxtral: hasVoxtralConfigured(),
+    session: session
+      ? {
+          state: session.state,
+          collectedData: session.collectedData,
+          createdAt: session.createdAt,
+        }
+      : null,
+  });
+});
+
 // Verificar status periodicamente
 setInterval(async () => {
   const status = await checkEvolutionStatus();
@@ -2346,6 +2483,15 @@ function bindServer(port) {
       );
     } else {
       logger.info(`  Agente Atendente: ${hasLLMConfigured() ? "Ativo (LLM)" : "Desativado (configure credenciais LLM)"}`);
+    }
+    if (hasTwilioConfigured() && hasVoxtralConfigured()) {
+      logger.info(`  Telefone: Twilio + Voxtral (Atendimento por voz)`);
+    } else if (hasTwilioConfigured()) {
+      logger.info(`  Telefone: Twilio configurado (adicione VOXTRAL_API_KEY)`);
+    } else if (hasVoxtralConfigured()) {
+      logger.info(`  Telefone: Voxtral configurado (adicione credenciais Twilio)`);
+    } else {
+      logger.info(`  Telefone: Desativado (configure Twilio + Voxtral)`);
     }
     logger.info(`========================================`);
   });
