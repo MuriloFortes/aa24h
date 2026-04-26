@@ -1228,37 +1228,6 @@ const routeKmStr = routeKm != null ? routeKm.toFixed(1) : null;
         logger.info({ clientPhone }, "_finalize: enviando mensagem ao CLIENTE");
         try {
           if (billingMode === "prepay_non_associate") {
-            await this.sendMessage(
-              winnerPhone,
-              `✅ *Liberação de saída — melhor custo-benefício*\n\n` +
-                `Você foi selecionado neste atendimento. Pode *iniciar o deslocamento*.\n` +
-                `💰 R$ ${Number(winner.price).toFixed(2)} · ⏱️ ${winner.etaMinutes} min.\n` +
-                (routeKmStr ? `📏 Trajeto (origem → destino): *${routeKmStr} km*\n` : "") +
-                `📋 Cliente: ${state.ticket.customerName || "—"}\n` +
-                `📍 Origem: ${state.ticket.location || "—"}\n` +
-                `📍 Destino: ${state.ticket.destination || "—"}\n` +
-                `🚗 Placa: ${state.ticket.vehiclePlate || "—"}\n\n` +
-                `📸 Quando o veículo estiver *no reboque*, envie *fotos* aqui.\n` +
-                `Em seguida envie sua *chave PIX* para repassarmos ao financeiro.`
-            );
-          } else {
-            await this.sendMessage(
-              winnerPhone,
-              `✅ *Proposta aceita!* Serviço confirmado com você.\n` +
-                `💰 R$ ${Number(winner.price).toFixed(2)} · ⏱️ ${winner.etaMinutes} min.\n` +
-                (routeKmStr ? `📏 Trajeto do serviço (origem → destino): *${routeKmStr} km*\n` : "") +
-                `📋 Cliente: ${state.ticket.customerName || "—"}\n` +
-                `📍 Origem: ${state.ticket.location || "—"}\n` +
-                `📍 Destino: ${state.ticket.destination || "—"}\n` +
-                `🚗 Placa: ${state.ticket.vehiclePlate || "—"}`
-            );
-          }
-        } catch {}
-      }
-      const clientPhone = state.ticket.phoneNumber;
-      if (clientPhone) {
-        try {
-          if (billingMode === "prepay_non_associate") {
             const pixKey = String(this.getSetting("association_pix_key", "") || "").trim();
             let payBlock = "";
             if (pixKey) {
