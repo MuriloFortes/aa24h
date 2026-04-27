@@ -527,16 +527,85 @@ class Orchestrator {
         "REQUEST_DENIED ou sem chave: no Google Cloud ative faturamento e as APIs Places, Geocoding e Distance Matrix; confira restrições da chave (IP/referrer). Enquanto isso use os links manuais do Maps abaixo.",
     });
 
+    const hasGoogleKey = !!process.env.GOOGLE_MAPS_API_KEY?.trim();
+    /** Com true + chave: sempre consulta Places e reordena local+Google por distância (não só quando faltam prestadores no SQLite). */
+    const mergeGooglePlaces =
+      process.env.GOOGLE_PLACES_MERGE === "true" && hasGoogleKey;
+    const localPoolLimit =
+      mergeGooglePlaces ? Math.max(maxProviders * 5, 25) : maxProviders;
+
     let providers = findNearestProviders(this.db, {
       lat,
       lng,
       serviceType: ticket.serviceType,
-      limit: maxProviders,
+      limit: localPoolLimit,
     });
 
     const placeDetailsFetched = [];
 
-    if (providers.length < maxProviders && process.env.GOOGLE_MAPS_API_KEY) {
+    const pushExternalFromPlaces = async (externalList, missingCap) => {
+      const existingPlaceIds = new Set(providers.map((p) => p.place_id || p.placeId).filter(Boolean));
+      const phoneDigits = (p) =>
+        String(p?.phone ?? p?.whatsapp ?? "").replace(/\D/g, "");
+      const seenPhones = new Set(providers.map(phoneDigits).filter(Boolean));
+      const cap = missingCap ?? externalList.length;
+      let added = 0;
+      for (const ext of externalList) {
+        if (!ext.placeId || existingPlaceIds.has(ext.placeId)) continue;
+        if (added >= cap && missingCap != null) break;
+        const details = await fetchPlaceDetails(ext.placeId);
+        placeDetailsFetched.push({
+          placeId: ext.placeId,
+          name: details?.name || ext.name,
+          phone: details?.phone || null,
+          address: details?.address || null,
+        });
+        if (!details?.phone) continue;
+        const d = phoneDigits({ phone: details.phone });
+        if (d && seenPhones.has(d)) continue;
+        if (d) seenPhones.add(d);
+        existingPlaceIds.add(ext.placeId);
+        providers.push({
+          id: null,
+          name: details.name || ext.name,
+          phone: details.phone,
+          whatsapp: details.phone,
+          latitude: details.location?.lat ?? ext.location?.lat,
+          longitude: details.location?.lng ?? ext.location?.lng,
+          address_text: details.address || ext.vicinity,
+          distance_km: ext.distance_km,
+          placeId: ext.placeId,
+          photoReference: details.photoReference,
+          external: true,
+        });
+        added++;
+      }
+    };
+
+    if (mergeGooglePlaces) {
+      try {
+        const { results: external, debug: nearbyDebug } = await searchNearbyTowProvidersDebug({
+          lat,
+          lng,
+          radiusMeters: 20000,
+          keyword: placesKeyword,
+        });
+        this._mergeGoogleDebug(ticket.attendanceId, {
+          placesNearbySearch: { ...nearbyDebug, keywordUsed: placesKeyword },
+        });
+        await pushExternalFromPlaces(external, 15);
+        this._mergeGoogleDebug(ticket.attendanceId, { placesDetailsSample: placeDetailsFetched });
+        const dist = (p) =>
+          Number.isFinite(p.distance_km) ? p.distance_km : Number.POSITIVE_INFINITY;
+        providers = providers.sort((a, b) => dist(a) - dist(b)).slice(0, maxProviders);
+      } catch (err) {
+        logger.warn({ err: err?.message }, "Falha ao mesclar com Google Places");
+        this._mergeGoogleDebug(ticket.attendanceId, {
+          placesNearbySearch: { error: err?.message, keywordUsed: placesKeyword },
+        });
+        providers = providers.slice(0, maxProviders);
+      }
+    } else if (providers.length < maxProviders && hasGoogleKey) {
       const missing = maxProviders - providers.length;
       try {
         const { results: external, debug: nearbyDebug } = await searchNearbyTowProvidersDebug({
@@ -548,31 +617,8 @@ class Orchestrator {
         this._mergeGoogleDebug(ticket.attendanceId, {
           placesNearbySearch: { ...nearbyDebug, keywordUsed: placesKeyword },
         });
-        const existingPlaceIds = new Set(providers.map((p) => p.place_id).filter(Boolean));
-        const candidates = external.filter((e) => e.placeId && !existingPlaceIds.has(e.placeId)).slice(0, missing);
-        for (const ext of candidates) {
-          const details = await fetchPlaceDetails(ext.placeId);
-          placeDetailsFetched.push({
-            placeId: ext.placeId,
-            name: details?.name || ext.name,
-            phone: details?.phone || null,
-            address: details?.address || null,
-          });
-          if (!details?.phone) continue;
-          providers.push({
-            id: null,
-            name: details.name || ext.name,
-            phone: details.phone,
-            whatsapp: details.phone,
-            latitude: details.location?.lat ?? ext.location?.lat,
-            longitude: details.location?.lng ?? ext.location?.lng,
-            address_text: details.address || ext.vicinity,
-            distance_km: ext.distance_km,
-            placeId: ext.placeId,
-            photoReference: details.photoReference,
-            external: true,
-          });
-        }
+        const candidates = external.filter((e) => e.placeId).slice(0, missing * 3);
+        await pushExternalFromPlaces(candidates, missing);
         this._mergeGoogleDebug(ticket.attendanceId, { placesDetailsSample: placeDetailsFetched });
       } catch (err) {
         logger.warn({ err: err?.message }, "Falha ao complementar com Google Places");
@@ -580,6 +626,8 @@ class Orchestrator {
           placesNearbySearch: { error: err?.message, keywordUsed: placesKeyword },
         });
       }
+    } else {
+      providers = providers.slice(0, maxProviders);
     }
 
     if (providers.length === 0) {
