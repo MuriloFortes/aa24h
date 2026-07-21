@@ -1,6 +1,5 @@
 {
-  "buildCommand": "npm run build",
-  "outputDirectory": "dist",
-  "installCommand": "npm install",
-  "rootDirectory": "web-client"
+  "buildCommand": "cd web-client && npm run build",
+  "outputDirectory": "web-client/dist",
+  "installCommand": "cd web-client && npm install"
 }
