@@ -1,0 +1,41 @@
+services:
+  - type: web
+    name: aa24h-api
+    runtime: node
+    repo: https://github.com/MuriloFortes/aa24h
+    buildCommand: npm install
+    startCommand: node server.js
+    healthCheckPath: /api/settings
+    envVars:
+      - key: PORT
+        value: "3003"
+      - key: OPENAI_API_KEY
+        sync: false
+      - key: OPENAI_MODEL
+        value: gpt-4o-mini
+      - key: EVOLUTION_API_URL
+        sync: false
+      - key: EVOLUTION_API_KEY
+        sync: false
+      - key: WHATSAPP_INSTANCE
+        sync: false
+      - key: WEBHOOK_GLOBAL_URL
+        sync: false
+      - key: DIAGNOSTIC_SECRET
+        sync: false
+      - key: SGA_API_BASE_URL
+        sync: false
+      - key: SGA_API_KEY
+        sync: false
+      - key: SGA_AUTH_USER
+        sync: false
+      - key: SGA_AUTH_PASSWORD
+        sync: false
+      - key: GOOGLE_MAPS_API_KEY
+        sync: false
+      - key: MERCADOPAGO_ACCESS_TOKEN
+        sync: false
+      - key: PIX_KEY
+        sync: false
+      - key: PIX_CITY
+        sync: false

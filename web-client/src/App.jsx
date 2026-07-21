@@ -12,8 +12,9 @@ import { SERVICE_TYPES, formatServiceList } from "./serviceTypes.js";
 import { extractLatLngFromText, normalizeBrazilLatLng } from "../../lib/locationParse.js";
 import { canonicalBrPhone as brPhoneCanonical } from "../../lib/phoneCanonical.js";
 
-const API = "/api";
-const socket = io({ transports: ["websocket", "polling"] });
+const BASE = import.meta.env.VITE_API_URL || "";
+const API = BASE ? `${BASE}/api` : "/api";
+const socket = io(BASE || undefined, { transports: ["websocket", "polling"] });
 
 /** Valor exibido na cotação: `counter_price` tem precedência sobre `offered_price`. */
 function negotiationQuotedPrice(n) {
