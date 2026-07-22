@@ -71,9 +71,8 @@ function normalizePhoneList(raw) {
 }
 
 function getTestModeConfig() {
-  const enabled =
-    (getSetting("test_mode") || "").toLowerCase() === "true" ||
-    process.env.TEST_MODE === "true";
+  const dbVal = (getSetting("test_mode") || "").toLowerCase();
+  const enabled = dbVal === "true" || (dbVal === "" && !process.env.TEST_MODE ? true : process.env.TEST_MODE === "true");
   const allowlist = normalizePhoneList(
     getSetting("test_allowlist") || process.env.TEST_ALLOWLIST || ""
   );
