@@ -913,6 +913,13 @@ class Orchestrator {
         phoneNumber,
         sessionForTicket?.collectedData || session.collectedData
       );
+
+      if (!ticket || ticket.blocked) {
+        conversationManager.clearConfirmationFlags(phoneNumber);
+        conversationManager.updateState(phoneNumber, STATES.AWAITING_GREETING);
+        return ticket || { blocked: true };
+      }
+
       conversationManager.clearConfirmationFlags(phoneNumber);
       conversationManager.updateState(phoneNumber, STATES.TICKET_CREATED);
 
@@ -927,7 +934,7 @@ class Orchestrator {
         /* ignore */
       }
 
-      const protocolLabel = ticket.protocol || ticket.attendanceId.slice(0, 8).toUpperCase();
+      const protocolLabel = ticket.protocol || ticket.attendanceId?.slice(0, 8)?.toUpperCase() || "—";
       let confirmMsg =
         `✅ *Chamado Registrado!*\n\n` +
         `📋 Protocolo: ${protocolLabel}\n` +
