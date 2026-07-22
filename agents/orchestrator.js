@@ -139,41 +139,16 @@ class Orchestrator {
         ? { blocked: false }
         : this._checkBusinessRulesLimit(callerKey, serviceType);
     if (limitCheck && limitCheck.blocked) {
-      this._dbRun(
-        `INSERT INTO attendances (id, protocol, caller_id, customer_name, vehicle_plate, service_type, status, location, vehicle_type, problem_type, notes, destination_address, block_reason, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, 'blocked', ?, ?, ?, ?, ?, ?, datetime('now'), datetime('now'))`,
-        [
-          attendanceId,
-          protocol,
-          callerKey,
-          ticketData.customer_name,
-          plateNorm,
-          serviceType,
-          locationText,
-          ticketData.vehicle_type || null,
-          ticketData.problem_type || null,
-          JSON.stringify(notesData),
-          notesData.destination || null,
-          limitCheck.reason,
-        ]
+      notesData.billing_mode = "prepay_non_associate";
+      notesData.sga_vehicle_reason = "limit_converted";
+      conversationManager.updateCollectedData(callerKey, {
+        billing_mode: "prepay_non_associate",
+        sga_vehicle_reason: "limit_converted",
+      });
+      logger.warn(
+        { phone: callerKey, serviceType, reason: limitCheck.reason },
+        "Limite atingido — convertendo para prepay_non_associate"
       );
-      try {
-        await this.sendMessage(
-          callerKey,
-          `⚠️ Não foi possível abrir um novo chamado: ${limitCheck.clientMsg}\nEntre em contato com a central para mais informações.`
-        );
-      } catch {}
-      try {
-        this.io.emit("attendance:blocked", {
-          attendanceId,
-          phoneNumber: callerKey,
-          customerName: ticketData.customer_name,
-          serviceType,
-          reason: limitCheck.reason,
-        });
-      } catch {}
-      logger.warn({ phone: callerKey, serviceType, reason: limitCheck.reason }, "Chamado bloqueado por regra de negócio");
-      return { blocked: true, reason: limitCheck.reason, clientMsg: limitCheck.clientMsg };
     }
 
     this._dbRun(
@@ -816,6 +791,27 @@ class Orchestrator {
         normalizeBrazilianPlate(session.collectedData.vehicle_plate) || session.collectedData.vehicle_plate || "";
       const sgaVehicle = await verifyVehicleActiveInSga(plate, phoneNumber);
 
+      if (sgaVehicle.skipped) {
+        conversationManager.updateCollectedData(phoneNumber, {
+          billing_mode: "prepay_non_associate",
+          sga_vehicle_reason: "skipped",
+        });
+        try {
+          this.io.emit("sga:verification_failed", {
+            reason: "skipped_non_associate",
+            plate,
+            customerName: session.collectedData.customer_name,
+            phone: phoneNumber,
+            clientMessage:
+              "ℹ️ Verificação SGA desabilitada. Seguindo como não associado (pagamento antecipado).",
+            panelDetail: "Fluxo não associado (SGA_SKIP_VEHICLE_VERIFY).",
+            at: new Date().toISOString(),
+          });
+        } catch (e) {
+          logger.warn({ e }, "emit sga:verification_failed");
+        }
+      }
+
       if (!sgaVehicle.ok && !sgaVehicle.skipped) {
         // Veículo não encontrado na base: sempre seguir com pré-pagamento (regra de negócio).
         // O toggle allow_non_associate_service no painel não deve bloquear este caso.
@@ -946,9 +942,17 @@ class Orchestrator {
         `🔧 ${ticket.serviceType}\n\n` +
         `Estamos enviando para os prestadores. Você receberá atualizações aqui.`;
       if (sessionForTicket?.collectedData?.billing_mode === "prepay_non_associate") {
+        const reason = sessionForTicket?.collectedData?.sga_vehicle_reason;
+        const prepayReason =
+          reason === "limit_converted"
+            ? "\n📌 Você excedeu o limite de atendimentos do seu plano. Este atendimento será *cobrado via PIX*."
+            : reason === "skipped"
+              ? ""
+              : "\n📌 Veículo não localizado na proteção veicular. Atendimento como *não associado*.";
         confirmMsg +=
-          `\n\n💳 *Pagamento antecipado:* haverá cobrança conforme o valor definido após as cotações.\n` +
-          `A *chave PIX da associação* e o *valor exato a pagar* serão enviados *neste chat assim que as cotações forem finalizadas*.`;
+          prepayReason +
+          `\n\n💳 *Pagamento antecipado:* valor definido após as cotações.\n` +
+          `A *chave PIX* e o *valor exato* serão enviados aqui.`;
       }
 
       ticket.confirmMessage = confirmMsg;
