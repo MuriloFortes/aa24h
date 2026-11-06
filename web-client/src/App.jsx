@@ -4219,7 +4219,7 @@ function SettingsGeneralSection() {
         <span className="text-sm text-slate-200">
           Exigir associado ativo no SGA antes de registrar o chamado
           <span className="block text-xs text-slate-500 mt-1">
-            Com isso ligado, cadastre o telefone (somente dígitos) na tabela <code className="text-slate-400">sga_associates</code> no banco ou desligue para desenvolvimento.
+            Desmarcado, o chamado segue sem essa trava. A consulta da proteção veicular só roda se a URL da API SGA estiver configurada no servidor, ou se esta opção estiver ligada.
           </span>
         </span>
       </label>

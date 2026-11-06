@@ -814,9 +814,20 @@ class Orchestrator {
     if (confirmed) {
       const plate =
         normalizeBrazilianPlate(session.collectedData.vehicle_plate) || session.collectedData.vehicle_plate || "";
-      const sgaVehicle = await verifyVehicleActiveInSga(plate, phoneNumber);
+      const requireAssociate =
+        process.env.SGA_VALIDATE_ASSOCIATES === "true" ||
+        this._getSetting("sga_validate_associates") === "true";
+      const sgaApiConfigured = Boolean(String(process.env.SGA_API_BASE_URL || "").trim());
+      // Sem a opção do painel e sem URL da API, a confirmação segue. A mensagem
+      // "validação não está disponível" só existia porque a consulta rodava sempre.
+      const sgaVehicle =
+        requireAssociate || sgaApiConfigured
+          ? await verifyVehicleActiveInSga(plate, phoneNumber)
+          : { ok: true, skipped: true, reason: "disabled" };
 
-      if (!sgaVehicle.ok && !sgaVehicle.skipped) {
+      if (sgaVehicle.reason === "not_configured") {
+        logger.warn("SGA: API não configurada; atendimento segue sem validar a proteção veicular");
+      } else if (!sgaVehicle.ok && !sgaVehicle.skipped) {
         // Veículo não encontrado na base: sempre seguir com pré-pagamento (regra de negócio).
         // O toggle allow_non_associate_service no painel não deve bloquear este caso.
         if (sgaVehicle.reason === "not_found") {
