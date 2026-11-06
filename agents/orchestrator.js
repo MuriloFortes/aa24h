@@ -500,9 +500,12 @@ class Orchestrator {
     if (!latlng) {
       logger.info({ attendanceId: ticket.attendanceId }, "Sem coordenadas para iniciar round de cotação");
       try {
+        const web = /^web[_-]/i.test(String(ticket.phoneNumber || ""));
         await this.sendMessage(
           ticket.phoneNumber,
-          "⚠️ Não conseguimos localizar as coordenadas do endereço informado. Envie sua *localização pelo WhatsApp* (clipe → Localização) ou digite o endereço mais detalhado."
+          web
+            ? "⚠️ Não conseguimos localizar o endereço no mapa. Envie de novo com rua, número e cidade. Ex.: Rua X, 126, Belo Horizonte."
+            : "⚠️ Não conseguimos localizar as coordenadas do endereço informado. Envie sua *localização pelo WhatsApp* (clipe → Localização) ou digite o endereço com rua, número e cidade."
         );
       } catch {
         /* ignore */
@@ -631,6 +634,16 @@ class Orchestrator {
     }
 
     if (providers.length === 0) {
+      providers = this._providersForQuoteWithoutGeo(ticket.serviceType, maxProviders);
+      if (providers.length > 0) {
+        logger.info(
+          { attendanceId: ticket.attendanceId, count: providers.length },
+          "Cotação segue com prestadores cadastrados sem coordenada"
+        );
+      }
+    }
+
+    if (providers.length === 0) {
       logger.warn({ attendanceId: ticket.attendanceId }, "Nenhum prestador próximo para cotação");
       try {
         await this._notifyClientNoProviders(ticket.phoneNumber);
@@ -682,6 +695,23 @@ class Orchestrator {
       `Responda com valor e tempo. Ex.: *150 reais, 30 minutos*\n` +
       `Ou responda *RECUSO* se não puder atender.`
     );
+  }
+
+  _providersForQuoteWithoutGeo(serviceType, limit) {
+    let rows = [];
+    try {
+      rows = this.db.prepare(
+        `SELECT id, name, phone, whatsapp, services, latitude, longitude
+         FROM providers
+         WHERE active = 1 AND (available IS NULL OR available = 1)`
+      ).all();
+    } catch {
+      return [];
+    }
+    return rows
+      .filter((row) => row.whatsapp || row.phone)
+      .filter((row) => this._providerMatchesServiceType(row, serviceType))
+      .slice(0, limit);
   }
 
   _providerMatchesServiceType(provider, serviceType) {

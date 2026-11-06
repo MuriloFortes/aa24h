@@ -902,6 +902,9 @@ function AdminDashboard({ onSwitch, onLogout }) {
     socket.on("ticket:created", () => {
       loadData();
     });
+    socket.on("whatsapp:status", (status) => {
+      if (status && typeof status === "object") setWhatsappStatus(status);
+    });
     socket.on("whatsapp:message", (msg) => {
       setLiveMessages(prev => [msg, ...prev].slice(0, 100));
     });
@@ -933,6 +936,7 @@ function AdminDashboard({ onSwitch, onLogout }) {
       clearInterval(interval);
       socket.off("attendance:created");
       socket.off("ticket:created");
+      socket.off("whatsapp:status");
       socket.off("whatsapp:message");
       socket.off("outbound:blocked");
       socket.off("inbound:ignored");
@@ -1213,7 +1217,11 @@ function TopBar({ activeTab, whatsappStatus, attendancesCount, onOpenSettings })
               ? "bg-green-500/10 text-green-300 border-green-500/30"
               : "bg-red-500/10 text-red-300 border-red-500/30"
           }`}
-          title={whatsappStatus.connected ? "WhatsApp conectado" : "WhatsApp desconectado"}
+          title={
+            whatsappStatus.connected
+              ? `WhatsApp conectado${whatsappStatus.instance ? ` (${whatsappStatus.instance})` : ""}`
+              : whatsappStatus.error || "WhatsApp desconectado"
+          }
         >
           <span
             className={`w-2 h-2 rounded-full ${whatsappStatus.connected ? "bg-green-400 animate-pulse" : "bg-red-400"}`}

@@ -1476,18 +1476,113 @@ app.delete("/api/audio/:filename", (req, res) => {
   else res.status(404).json({ error: "Arquivo não encontrado" });
 });
 
+function evolutionStateOf(payload) {
+  const bag = payload?.instance && typeof payload.instance === "object" ? payload.instance : payload;
+  const raw = bag?.state || bag?.connectionStatus || bag?.status || payload?.state || "";
+  const state = String(raw || "").toLowerCase();
+  if (state === "open" || state === "connected" || state === "online") return "open";
+  return state;
+}
+
+function evolutionInstanceName(payload) {
+  return (
+    payload?.instance?.instanceName ||
+    payload?.instanceName ||
+    payload?.name ||
+    ""
+  );
+}
+
+async function listEvolutionInstances() {
+  const response = await axios.get(`${EVOLUTION_API_URL.replace(/\/$/, "")}/instance/fetchInstances`, {
+    headers: { apikey: EVOLUTION_API_KEY },
+    timeout: 8000,
+    validateStatus: () => true,
+  });
+  const body = response.data;
+  const list = Array.isArray(body) ? body : body?.instances || body?.data || [];
+  if (!Array.isArray(list)) return [];
+  return list
+    .map((item) => ({
+      name: evolutionInstanceName(item),
+      state: evolutionStateOf(item),
+      number: String(item?.ownerJid || item?.owner || item?.instance?.wuid || "").split("@")[0].split(":")[0],
+    }))
+    .filter((item) => item.name);
+}
+
+let evolutionWebhookReadyFor = "";
+
+async function ensureEvolutionWebhook(instanceName) {
+  if (!instanceName || evolutionWebhookReadyFor === instanceName) return;
+  const internal = String(EVOLUTION_API_URL || "").includes("evolution-api");
+  const url = process.env.EVOLUTION_WEBHOOK_URL || (internal ? "http://app:3003/api/whatsapp/webhook" : "");
+  if (!url) return;
+  try {
+    const response = await axios.post(
+      `${EVOLUTION_API_URL.replace(/\/$/, "")}/webhook/set/${encodeURIComponent(instanceName)}`,
+      {
+        webhook: {
+          enabled: true,
+          url,
+          webhookByEvents: false,
+          events: ["MESSAGES_UPSERT", "CONNECTION_UPDATE"],
+        },
+      },
+      { headers: { apikey: EVOLUTION_API_KEY }, timeout: 8000, validateStatus: () => true }
+    );
+    if (response.status >= 400) {
+      logger.warn({ status: response.status, instanceName }, "Evolution recusou a configuração do webhook");
+      return;
+    }
+    evolutionWebhookReadyFor = instanceName;
+    logger.info({ instanceName, url }, "Webhook da Evolution apontado para o app");
+  } catch (err) {
+    logger.warn({ err: err?.message }, "Não foi possível configurar o webhook da Evolution");
+  }
+}
+
 async function checkEvolutionStatus() {
   if (!EVOLUTION_API_URL || !EVOLUTION_API_KEY) {
     return { connected: false, error: "Evolution API não configurada" };
   }
-  
+
   try {
-    const response = await axios.get(`${EVOLUTION_API_URL}/instance/connectionState/${whatsappInstance}`, {
-      headers: { "apikey": EVOLUTION_API_KEY }
-    });
-    return { connected: response.data.instance?.state === "open", state: response.data.instance?.state };
+    const response = await axios.get(
+      `${EVOLUTION_API_URL.replace(/\/$/, "")}/instance/connectionState/${encodeURIComponent(whatsappInstance)}`,
+      { headers: { apikey: EVOLUTION_API_KEY }, timeout: 8000, validateStatus: () => true }
+    );
+    let state = evolutionStateOf(response.data);
+    let number = "";
+    let instance = whatsappInstance;
+
+    if (state !== "open") {
+      const instances = await listEvolutionInstances();
+      const open = instances.find((item) => item.state === "open");
+      if (open) {
+        state = "open";
+        instance = open.name;
+        number = open.number || "";
+        if (open.name !== whatsappInstance) {
+          logger.info({ de: whatsappInstance, para: open.name }, "WhatsApp ativo em outra instância; usando essa");
+          whatsappInstance = open.name;
+        }
+      } else if (response.status >= 400) {
+        return {
+          connected: false,
+          state,
+          instance,
+          error: `Evolution HTTP ${response.status} na instância ${whatsappInstance}`,
+        };
+      }
+    }
+
+    if (state === "open") {
+      await ensureEvolutionWebhook(instance);
+    }
+    return { connected: state === "open", state, number, instance };
   } catch (err) {
-    return { connected: false, error: err.message };
+    return { connected: false, error: err.message, instance: whatsappInstance };
   }
 }
 
@@ -2356,13 +2451,21 @@ setInterval(async () => {
   whatsappConnected = status.connected;
   
   if (status.connected && !wasConnected) {
-    whatsappNumber = status.number || "Conectado";
-    io.emit("whatsapp:connected", { number: whatsappNumber });
+    whatsappNumber = status.number || whatsappNumber || "Conectado";
     db.prepare("INSERT OR REPLACE INTO settings (key, value) VALUES ('whatsapp_connected', 'true')").run();
+    if (whatsappNumber) {
+      db.prepare("INSERT OR REPLACE INTO settings (key, value) VALUES ('whatsapp_number', ?)").run(whatsappNumber);
+    }
   } else if (!status.connected && wasConnected) {
-    io.emit("whatsapp:disconnected");
     db.prepare("INSERT OR REPLACE INTO settings (key, value) VALUES ('whatsapp_connected', 'false')").run();
   }
+  io.emit("whatsapp:status", {
+    connected: status.connected,
+    state: status.state || null,
+    number: status.number || whatsappNumber || "",
+    instance: status.instance || whatsappInstance,
+    error: status.error || null,
+  });
 }, 30000);
 
 function bindServer(port) {
