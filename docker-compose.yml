@@ -1,65 +1,69 @@
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
 services:
   app:
     build: .
     container_name: reboque-app
     restart: always
+    logging: *default-logging
     ports:
       - "${PORT:-3003}:3003"
+    env_file:
+      - .env
     environment:
-      - PORT=3003
-      - PG_HOST=postgres
-      - PG_PORT=5432
-      - PG_DATABASE=${PG_DATABASE:-reboque_inteligente}
-      - PG_USER=${PG_USER:-postgres}
-      - PG_PASSWORD=${PG_PASSWORD:-postgres}
-      - REDIS_HOST=redis
-      - REDIS_PORT=6379
-      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
-      - OPENAI_MODEL=${OPENAI_MODEL:-gpt-4o-mini}
-      - EVOLUTION_API_URL=http://evolution-api:8080
-      - EVOLUTION_API_KEY=${EVOLUTION_API_KEY:-minhachavesecreta}
-      - WHATSAPP_INSTANCE=${WHATSAPP_INSTANCE:-sga-instance}
-      - PIX_KEY=${PIX_KEY:-}
-      - PIX_CITY=${PIX_CITY:-SAO PAULO}
-      - GOOGLE_MAPS_API_KEY=${GOOGLE_MAPS_API_KEY:-}
+      PORT: "3003"
+      NODE_ENV: production
+      SQLITE_PATH: /app/data/attendance.db
+      PG_HOST: postgres
+      PG_PORT: "5432"
+      REDIS_HOST: redis
+      REDIS_PORT: "6379"
+      EVOLUTION_API_URL: http://evolution-api:8080
+    volumes:
+      - appdata:/app/data
+      - app_audio:/app/audio
     depends_on:
       postgres:
         condition: service_healthy
       redis:
         condition: service_healthy
     healthcheck:
-      test: ["CMD", "node", "-e", "fetch('http://localhost:3003/api/settings').then(r=>r.ok?process.exit(0):process.exit(1)).catch(()=>process.exit(1))"]
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3003/api/health').then(r=>r.ok?process.exit(0):process.exit(1)).catch(()=>process.exit(1))"]
       interval: 30s
       timeout: 10s
-      retries: 3
+      retries: 5
+      start_period: 40s
 
   postgres:
     image: postgis/postgis:16-3.4
     container_name: reboque-postgres
     restart: always
-    ports:
-      - "${PG_PORT:-5432}:5432"
+    logging: *default-logging
     environment:
       POSTGRES_DB: ${PG_DATABASE:-reboque_inteligente}
       POSTGRES_USER: ${PG_USER:-postgres}
       POSTGRES_PASSWORD: ${PG_PASSWORD:-postgres}
     volumes:
       - pgdata:/var/lib/postgresql/data
-      - ./database/schema.sql:/docker-entrypoint-initdb.d/01-schema.sql
-      - ./database/init-evolution-db.sh:/docker-entrypoint-initdb.d/00-init-evolution.sh
+      - ./database/schema.sql:/docker-entrypoint-initdb.d/01-schema.sql:ro
+      - ./database/init-evolution-db.sh:/docker-entrypoint-initdb.d/00-init-evolution.sh:ro
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${PG_USER:-postgres}"]
+      test: ["CMD-SHELL", "pg_isready -U ${PG_USER:-postgres} -d ${PG_DATABASE:-reboque_inteligente}"]
       interval: 10s
       timeout: 5s
-      retries: 5
+      retries: 10
+      start_period: 20s
 
   redis:
     image: redis:7-alpine
     container_name: reboque-redis
     restart: always
-    ports:
-      - "${REDIS_PORT:-6379}:6379"
-    command: redis-server --appendonly yes --requirepass ${REDIS_PASSWORD:-}
+    logging: *default-logging
+    command: redis-server --appendonly yes
     volumes:
       - redisdata:/data
     healthcheck:
@@ -72,14 +76,16 @@ services:
     image: evoapicloud/evolution-api:v2.3.7
     container_name: evolution-api
     restart: always
+    logging: *default-logging
     ports:
-      - "8080:8080"
+      - "${EVOLUTION_PORT:-8080}:8080"
     environment:
       - SERVER_URL=${EVOLUTION_SERVER_URL:-http://localhost:8080}
       - AUTHENTICATION_API_KEY=${EVOLUTION_API_KEY:-minhachavesecreta}
       - DATABASE_ENABLED=true
       - DATABASE_PROVIDER=postgresql
       - DATABASE_CONNECTION_URI=postgresql://${PG_USER:-postgres}:${PG_PASSWORD:-postgres}@postgres:5432/evolution?schema=public
+      - DATABASE_CONNECTION_CLIENT_NAME=evolution_reboque
       - DATABASE_SAVE_DATA_INSTANCE=true
       - DATABASE_SAVE_DATA_NEW_MESSAGE=true
       - DATABASE_SAVE_MESSAGE_UPDATE=true
@@ -90,19 +96,43 @@ services:
       - CACHE_REDIS_ENABLED=false
       - CACHE_LOCAL_ENABLED=true
       - WEBHOOK_GLOBAL_ENABLED=true
-      - WEBHOOK_GLOBAL_URL=${WEBHOOK_GLOBAL_URL:-http://host.docker.internal:3003/api/whatsapp/webhook}
+      - WEBHOOK_GLOBAL_URL=http://app:3003/api/whatsapp/webhook
       - WEBHOOK_GLOBAL_WEBHOOK_BY_EVENTS=true
       - WEBHOOK_EVENTS_MESSAGES_UPSERT=true
       - WEBHOOK_EVENTS_CONNECTION_UPDATE=true
     depends_on:
       postgres:
         condition: service_healthy
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
+      app:
+        condition: service_healthy
     volumes:
       - evolution_instances:/evolution/instances
+
+  caddy:
+    image: caddy:2.8-alpine
+    container_name: reboque-caddy
+    profiles: ["https"]
+    restart: always
+    logging: *default-logging
+    ports:
+      - "80:80"
+      - "443:443"
+    environment:
+      APP_DOMAIN: ${APP_DOMAIN:-}
+      ACME_EMAIL: ${ACME_EMAIL:-}
+    volumes:
+      - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      app:
+        condition: service_healthy
 
 volumes:
   pgdata:
   redisdata:
   evolution_instances:
+  appdata:
+  app_audio:
+  caddy_data:
+  caddy_config:

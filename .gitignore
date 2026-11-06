@@ -3,4 +3,4 @@
 *.db
 *.db-shm
 *.db-wal
-.dockerignore
+.venv-pdf/

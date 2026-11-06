@@ -7,9 +7,11 @@
     "dev": "node --watch server.js",
     "start": "node server.js",
     "db:migrate": "node database/migrate.js",
-    "db:setup": "docker compose up -d postgres redis && timeout 5 && node database/migrate.js",
+    "db:pg-init": "node -e \"import('./database/pgBootstrap.js').then(async m=>{const r=await m.bootstrapPostgres();console.log(r);process.exit(r.ok?0:1)})\"",
+    "db:setup": "docker compose up -d postgres redis && sleep 5 && npm run db:pg-init",
     "docker:up": "docker compose up -d",
-    "docker:down": "docker compose down"
+    "docker:down": "docker compose down",
+    "docker:build": "docker compose build app"
   },
   "dependencies": {
     "@opencode-ai/sdk": "^1.4.3",
@@ -25,6 +27,6 @@
     "pino-pretty": "^10.3.1",
     "qrcode": "^1.5.3",
     "socket.io": "^4.7.5",
-    "uuid": "^9.0.1"
+    "uuid": "^14.0.1"
   }
 }

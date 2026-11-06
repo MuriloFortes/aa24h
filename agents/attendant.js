@@ -2,6 +2,11 @@ import { logger } from "../lib/logger.js";
 import { conversationManager, STATES } from "./conversationFlow.js";
 import { normalizeBrazilianPlate, compactPlateFromNoisyText } from "../lib/plate.js";
 import { resolveMessageThreadKey, digitsOnlyPhone } from "../lib/phoneCanonical.js";
+import {
+  isVehicleLookupConfigured,
+  lookupVehicleByPlate,
+  vehicleLookupToCollectedPatch,
+} from "../services/vehicleLookup.js";
 
 /** Mesma lógica de chave que conversationFlow (fila anti-duplicata alinhada à sessão). */
 function chatSessionKey(phoneNumber) {
@@ -29,7 +34,18 @@ export function hasLLMConfigured() {
 }
 
 const DEFAULT_WELCOME_MESSAGE =
-  "Olá! Sou a assistente virtual da SGA Assistência.";
+  "Olá! Sou a assistente virtual do *Reboque Já!*";
+
+/**
+ * Fluxo de coleta:
+ * - brief (padrão): 4 perguntas + confirmação — emergência rápida
+ * - full: questionário completo legado
+ * Env: ATTENDANCE_FLOW=brief|full
+ */
+export function getAttendanceFlow() {
+  const v = String(process.env.ATTENDANCE_FLOW || "brief").toLowerCase().trim();
+  return v === "full" ? "full" : "brief";
+}
 
 export function requiresTowingAccessForProblem(problemType) {
   if (!problemType) return false;
@@ -66,12 +82,36 @@ function extractFirstValidPlate(text) {
   return null;
 }
 
+function looksLikeAddress(text) {
+  const t = String(text || "").trim();
+  if (!t) return false;
+  if (/localiza[cç][aã]o|\[?\s*-?\d{1,3}\.\d+\s*,\s*-?\d{1,3}\.\d+/i.test(t)) return true;
+  if (/\b(rua|r\.|av\.?|avenida|estrada|rod\.?|rodovia|alameda|travessa|tv\.|bairro|cep|km)\b/i.test(t)) {
+    return true;
+  }
+  // endereço típico: letras + número
+  if (/\d/.test(t) && /[a-záàâãéêíóôõúüç]{3,}/i.test(t) && t.length >= 8) return true;
+  return false;
+}
+
+function isGreetingOrIntentOnly(text) {
+  const t = String(text || "").trim().toLowerCase();
+  if (looksLikeAddress(t)) return false;
+  return /^(oi+|ol[aá]|bom dia|boa tarde|boa noite|hey|opa|e a[ií]|preciso|quero|ajuda|socorro|reboque|guincho)\b/i.test(
+    t
+  );
+}
+
 function isValidAddress(text) {
   const t = (text || "").trim();
   if (t.length < 5) return false;
   if (/^\d+$/.test(t)) return false;
   if (!/[a-záàâãéêíóôõúüç]/i.test(t)) return false;
-  return true;
+  if (isGreetingOrIntentOnly(t)) return false;
+  // exige indício de endereço (evita "preciso de reboque" virar origem)
+  if (!looksLikeAddress(t) && t.length < 15) return false;
+  if (!looksLikeAddress(t) && /^(preciso|quero|ajuda)/i.test(t)) return false;
+  return looksLikeAddress(t) || t.length >= 15;
 }
 
 function isValidReceiverInfo(text) {
@@ -91,7 +131,61 @@ function isValidName(text) {
 
 /* ─── Etapas de coleta ─── */
 
-const COLLECTION_STEPS = [
+function parseProblemType(text) {
+  const t = String(text || "").toLowerCase();
+  let pt = "reboque";
+  if (/bateria|carga/.test(t)) pt = "bateria_descarregada";
+  else if (/pneu|calibr/.test(t)) pt = "pneu_furado";
+  else if (/chave/.test(t)) pt = "chave_trancada";
+  else if (/combust|gasolina|diesel/.test(t)) pt = "sem_combustivel";
+  else if (/el[eé]tr/.test(t)) pt = "pane_eletrica";
+  else if (/mec[aâ]nic|motor/.test(t)) pt = "pane_mecanica";
+  else if (/acidente|batida|colis/.test(t)) pt = "acidente";
+  return { problem_type: pt };
+}
+
+function parseScheduleType(text) {
+  const t = String(text || "").toLowerCase();
+  const wantsScheduled =
+    /agend|depois|mais tarde|amanh[ãa]|marcar|programad|hor[áa]rio|outro dia|combinad|marcado/i.test(t);
+  const wantsNow =
+    /\bagora\b|urgent|imediat|j[áa]\b|imediato|logo|r[áa]pid|emerg|\bhoje\b/i.test(t);
+  if (wantsScheduled && !wantsNow) return { schedule_type: "agendado" };
+  if (wantsNow && !wantsScheduled) return { schedule_type: "agora" };
+  if (wantsScheduled && wantsNow) {
+    if (/n[aã]o[^\n]{0,20}\bagenda|n[aã]o[^\n]{0,20}\bagora|depois|agend|marcar/i.test(t)) {
+      return { schedule_type: /depois|agend|marcar|programad|hor[áa]rio/i.test(t) ? "agendado" : "agora" };
+    }
+    return { schedule_type: "agora" };
+  }
+  if (/agend/.test(t)) return { schedule_type: "agendado" };
+  return { schedule_type: "agora" };
+}
+
+function parseDestinationBrief(text) {
+  const t = String(text || "").trim();
+  const low = t.toLowerCase();
+  if (/oficina|guincho|borrachar|mec[aâ]nic/i.test(low)) {
+    return { destination: t.length >= 5 ? t : "oficina / mecânica próxima" };
+  }
+  if (/n[aã]o sei|nao sei|qualquer|mais pr[oó]xim/i.test(low)) {
+    return { destination: "oficina próxima (a definir)" };
+  }
+  if (/mesmo (bairro|munic[ií]pio|cidade)|aqui perto/i.test(low)) {
+    return { destination: t };
+  }
+  return { destination: t };
+}
+
+function isValidDestinationBrief(text) {
+  const t = (text || "").trim();
+  if (t.length < 3) return false;
+  if (/^\d+$/.test(t)) return false;
+  return true;
+}
+
+/** Fluxo completo (legado / B2B detalhado). */
+const COLLECTION_STEPS_FULL = [
   {
     field: "schedule_type",
     question: "O atendimento será para *agora* ou *agendado*?",
@@ -104,23 +198,7 @@ const COLLECTION_STEPS = [
       );
     },
     reask: "Por favor, responda *agora* ou *agendado* (ou *depois* / *agendar*).",
-    parse: (text) => {
-      const t = text.toLowerCase();
-      const wantsScheduled =
-        /agend|depois|mais tarde|amanh[ãa]|marcar|programad|hor[áa]rio|outro dia|combinad|marcado/i.test(t);
-      const wantsNow =
-        /\bagora\b|urgent|imediat|j[áa]\b|imediato|logo|r[áa]pid|emerg|\bhoje\b/i.test(t);
-      if (wantsScheduled && !wantsNow) return { schedule_type: "agendado" };
-      if (wantsNow && !wantsScheduled) return { schedule_type: "agora" };
-      if (wantsScheduled && wantsNow) {
-        if (/n[aã]o[^\n]{0,20}\bagenda|n[aã]o[^\n]{0,20}\bagora|depois|agend|marcar/i.test(t)) {
-          return { schedule_type: /depois|agend|marcar|programad|hor[áa]rio/i.test(t) ? "agendado" : "agora" };
-        }
-        return { schedule_type: "agora" };
-      }
-      if (/agend/.test(t)) return { schedule_type: "agendado" };
-      return { schedule_type: "agora" };
-    },
+    parse: parseScheduleType,
   },
   {
     field: "customer_name",
@@ -162,18 +240,7 @@ const COLLECTION_STEPS = [
     question: "Qual o *problema* ou *serviço* que você precisa? (ex.: reboque, pane elétrica, pneu furado, combustível, chaveiro)",
     validate: () => true,
     reask: "",
-    parse: (text) => {
-      const t = text.toLowerCase();
-      let pt = "reboque";
-      if (/bateria|carga/.test(t)) pt = "bateria_descarregada";
-      else if (/pneu|calibr/.test(t)) pt = "pneu_furado";
-      else if (/chave/.test(t)) pt = "chave_trancada";
-      else if (/combust|gasolina|diesel/.test(t)) pt = "sem_combustivel";
-      else if (/el[eé]tr/.test(t)) pt = "pane_eletrica";
-      else if (/mec[aâ]nic|motor/.test(t)) pt = "pane_mecanica";
-      else if (/acidente|batida|colis/.test(t)) pt = "acidente";
-      return { problem_type: pt };
-    },
+    parse: parseProblemType,
   },
   {
     field: "towing_access",
@@ -206,8 +273,97 @@ const COLLECTION_STEPS = [
   },
 ];
 
+/**
+ * Fluxo breve (MVP emergência): ~4 perguntas.
+ * Defaults preenchidos automaticamente antes da confirmação.
+ */
+const COLLECTION_STEPS_BRIEF = [
+  {
+    field: "location",
+    question:
+      "Onde está o veículo agora? Envie o *endereço* ou compartilhe a *localização* pelo WhatsApp.",
+    validate: isValidAddress,
+    reask: "Preciso do *local do veículo* (rua, número, bairro ou pin de localização).",
+    parse: (text) => ({ location: text.trim() }),
+  },
+  {
+    field: "destination",
+    question:
+      "Para onde levar? Informe o *destino* ou diga *oficina próxima* se ainda não souber.",
+    validate: isValidDestinationBrief,
+    reask: "Informe o *destino* (endereço) ou *oficina próxima*.",
+    parse: parseDestinationBrief,
+  },
+  {
+    field: "vehicle_type",
+    question: "Qual a *marca e o modelo* do veículo? (ex.: Fiat Mobi, Honda Civic, Moto CG)",
+    validate: (text) => String(text || "").trim().length >= 2,
+    reask: "Informe a *marca e o modelo* (ex.: Fiat Uno, VW Gol).",
+    parse: (text) => ({ vehicle_type: text.trim() }),
+  },
+  {
+    field: "problem_type",
+    question:
+      "O que você precisa? Ex.: *reboque*, *bateria*, *pneu*, *combustível*, *chaveiro*.",
+    validate: () => true,
+    reask: "",
+    parse: parseProblemType,
+  },
+];
+
+function getCollectionSteps() {
+  return getAttendanceFlow() === "full" ? COLLECTION_STEPS_FULL : COLLECTION_STEPS_BRIEF;
+}
+
+/** Todos os steps (para edição no resumo). */
+function getAllCollectionSteps() {
+  const byField = new Map();
+  for (const s of [...COLLECTION_STEPS_BRIEF, ...COLLECTION_STEPS_FULL]) {
+    if (!byField.has(s.field)) byField.set(s.field, s);
+  }
+  return [...byField.values()];
+}
+
+/**
+ * Preenche campos opcionais no fluxo brief para o orquestrador não quebrar.
+ */
+export function applyFlowDefaults(collectedData, phoneNumber = "") {
+  const data = { ...(collectedData || {}) };
+  if (getAttendanceFlow() !== "brief") return data;
+
+  if (fieldIsEmpty(data.schedule_type)) data.schedule_type = "agora";
+  if (fieldIsEmpty(data.customer_name)) {
+    const digits = String(phoneNumber || "").replace(/\D/g, "");
+    data.customer_name = digits.length >= 4 ? `Cliente ${digits.slice(-4)}` : "Cliente";
+  }
+  if (fieldIsEmpty(data.vehicle_plate)) data.vehicle_plate = "";
+  if (fieldIsEmpty(data.towing_access)) data.towing_access = "facil";
+  if (fieldIsEmpty(data.receiver_info)) data.receiver_info = "mesmo solicitante";
+  if (fieldIsEmpty(data.ride_along)) data.ride_along = "não";
+  return data;
+}
+
 function fieldIsEmpty(val) {
   return val === null || val === undefined || String(val).trim() === "";
+}
+
+async function enrichVehicleFromPlate(phoneNumber, plate) {
+  if (!isVehicleLookupConfigured()) return;
+  try {
+    const result = await lookupVehicleByPlate(plate);
+    const patch = vehicleLookupToCollectedPatch(result);
+    if (Object.keys(patch).length) {
+      conversationManager.updateCollectedData(phoneNumber, patch);
+      logger.info(
+        { phone: phoneNumber, plate, vehicle_type: patch.vehicle_type, source: result.source },
+        "Veículo enriquecido via consulta de placa"
+      );
+    } else {
+      logger.info({ phone: phoneNumber, plate, error: result.error }, "Consulta de placa sem modelo");
+    }
+  } catch (err) {
+    logger.warn({ err: err?.message, plate }, "Falha ao enriquecer veículo por placa");
+  }
 }
 
 const EDITABLE_FIELDS = {
@@ -241,7 +397,7 @@ function normalizeText(text) {
 }
 
 function findStepByField(field) {
-  return COLLECTION_STEPS.find((s) => s.field === field) || null;
+  return getAllCollectionSteps().find((s) => s.field === field) || null;
 }
 
 function detectEditField(text) {
@@ -282,7 +438,7 @@ function resetCollectedData() {
 }
 
 function getNextStep(collectedData) {
-  for (const step of COLLECTION_STEPS) {
+  for (const step of getCollectionSteps()) {
     if (fieldIsEmpty(collectedData[step.field])) {
       return step;
     }
@@ -298,6 +454,19 @@ function buildSummary(data) {
     bateria_descarregada: "bateria descarregada", reboque: "reboque", outro: "outro",
   };
   const prob = PROBLEM_LABELS[data.problem_type] || data.problem_type || "—";
+  const brief = getAttendanceFlow() === "brief";
+
+  if (brief) {
+    return (
+      `📋 *Resumo rápido*\n\n` +
+      `📍 *Origem:* ${data.location || "—"}\n` +
+      `📍 *Destino:* ${data.destination || "—"}\n` +
+      `🏷️ *Veículo:* ${data.vehicle_type || "—"}\n` +
+      `🔧 *Serviço:* ${prob}\n\n` +
+      `Confirma? Responda *sim* ou diga o que corrigir (ex.: *modelo*, *destino*).`
+    );
+  }
+
   const twMap = { facil: "fácil", dificil: "difícil / com ressalva", bloqueado: "bloqueado" };
   const tw = twMap[data.towing_access] || data.towing_access || "—";
   const sched = data.schedule_type === "agendado" ? "Agendado" : "Para agora";
@@ -356,6 +525,9 @@ async function processMessageImpl(phoneNumber, userMessage, options = {}) {
         const parsed = currentStep.parse(userMessage);
         conversationManager.updateCollectedData(phoneNumber, parsed);
         logger.info({ phone: phoneNumber, field: currentStep.field, parsed }, "Dado coletado");
+        if (currentStep.field === "vehicle_plate" && parsed.vehicle_plate) {
+          await enrichVehicleFromPlate(phoneNumber, parsed.vehicle_plate);
+        }
       }
     } else {
       /* Primeira mensagem: antes só enviávamos a pergunta e ignorávamos o texto — ex.: "preciso para agora" gerava de novo "agora ou agendado?". */
@@ -364,6 +536,16 @@ async function processMessageImpl(phoneNumber, userMessage, options = {}) {
         const parsed = firstStep.parse(userMessage);
         conversationManager.updateCollectedData(phoneNumber, parsed);
         logger.info({ phone: phoneNumber, field: firstStep.field, parsed }, "Dado coletado (primeira mensagem)");
+        if (firstStep.field === "vehicle_plate" && parsed.vehicle_plate) {
+          await enrichVehicleFromPlate(phoneNumber, parsed.vehicle_plate);
+        }
+      } else if (getAttendanceFlow() === "brief") {
+        /* Saudação/intenção: "preciso de reboque" já pré-preenche o serviço. */
+        if (/reboque|guincho|bateria|pneu|chave|combust|pane|acidente/i.test(userMessage)) {
+          const parsed = parseProblemType(userMessage);
+          conversationManager.updateCollectedData(phoneNumber, parsed);
+          logger.info({ phone: phoneNumber, parsed }, "Intenção de serviço na primeira mensagem (brief)");
+        }
       }
     }
 
@@ -382,7 +564,9 @@ async function processMessageImpl(phoneNumber, userMessage, options = {}) {
     }
 
     conversationManager.updateState(phoneNumber, STATES.CONFIRMING_DATA);
-    const ticketData = { ...conversationManager.getSession(phoneNumber).collectedData };
+    const rawData = { ...conversationManager.getSession(phoneNumber).collectedData };
+    const ticketData = applyFlowDefaults(rawData, phoneNumber);
+    conversationManager.updateCollectedData(phoneNumber, ticketData);
     conversationManager.setPendingConfirmation(phoneNumber, true);
     conversationManager.setSkipConfirmSameTurn(phoneNumber, true);
     const summary = buildSummary(ticketData);
@@ -398,7 +582,10 @@ async function processMessageImpl(phoneNumber, userMessage, options = {}) {
       const firstStep = getNextStep(conversationManager.getSession(phoneNumber).collectedData);
       const reply =
         "Atendimento cancelado e reiniciado com sucesso.\n\n" +
-        (firstStep?.question || "Vamos começar novamente. Qual é o seu *nome completo*?");
+        (firstStep?.question ||
+          (getAttendanceFlow() === "brief"
+            ? "Vamos começar de novo. Onde está o veículo agora?"
+            : "Vamos começar novamente. Qual é o seu *nome completo*?"));
       conversationManager.addMessage(phoneNumber, "assistant", reply);
       return {
         response: reply,
@@ -418,10 +605,17 @@ async function processMessageImpl(phoneNumber, userMessage, options = {}) {
         }
         const parsed = step.parse(userMessage);
         conversationManager.updateCollectedData(phoneNumber, parsed);
+        if (step.field === "vehicle_plate" && parsed.vehicle_plate) {
+          await enrichVehicleFromPlate(phoneNumber, parsed.vehicle_plate);
+        }
         conversationManager.setPendingEditField(phoneNumber, null);
         conversationManager.setPendingConfirmation(phoneNumber, true);
         conversationManager.setSkipConfirmSameTurn(phoneNumber, true);
-        const updated = conversationManager.getSession(phoneNumber).collectedData;
+        const updated = applyFlowDefaults(
+          conversationManager.getSession(phoneNumber).collectedData,
+          phoneNumber
+        );
+        conversationManager.updateCollectedData(phoneNumber, updated);
         const summary = buildSummary(updated);
         conversationManager.addMessage(phoneNumber, "assistant", summary);
         return { response: summary, ticketData: updated, state: STATES.CONFIRMING_DATA, collectedData: updated };
@@ -432,10 +626,15 @@ async function processMessageImpl(phoneNumber, userMessage, options = {}) {
     const inlinePlate = extractFirstValidPlate(userMessage);
     if (inlinePlate && (editField === "vehicle_plate" || isValidPlate(userMessage))) {
       conversationManager.updateCollectedData(phoneNumber, { vehicle_plate: inlinePlate });
+      await enrichVehicleFromPlate(phoneNumber, inlinePlate);
       conversationManager.setPendingEditField(phoneNumber, null);
       conversationManager.setPendingConfirmation(phoneNumber, true);
       conversationManager.setSkipConfirmSameTurn(phoneNumber, true);
-      const updated = conversationManager.getSession(phoneNumber).collectedData;
+      const updated = applyFlowDefaults(
+        conversationManager.getSession(phoneNumber).collectedData,
+        phoneNumber
+      );
+      conversationManager.updateCollectedData(phoneNumber, updated);
       const summary = buildSummary(updated);
       conversationManager.addMessage(phoneNumber, "assistant", summary);
       return { response: summary, ticketData: updated, state: STATES.CONFIRMING_DATA, collectedData: updated };

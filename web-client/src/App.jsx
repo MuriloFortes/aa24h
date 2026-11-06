@@ -12,9 +12,8 @@ import { SERVICE_TYPES, formatServiceList } from "./serviceTypes.js";
 import { extractLatLngFromText, normalizeBrazilLatLng } from "../../lib/locationParse.js";
 import { canonicalBrPhone as brPhoneCanonical } from "../../lib/phoneCanonical.js";
 
-const BASE = import.meta.env.VITE_API_URL || "";
-const API = BASE ? `${BASE}/api` : "/api";
-const socket = io(BASE || undefined, { transports: ["websocket", "polling"] });
+const API = "/api";
+const socket = io({ transports: ["websocket", "polling"] });
 
 /** Valor exibido na cotação: `counter_price` tem precedência sobre `offered_price`. */
 function negotiationQuotedPrice(n) {
@@ -474,10 +473,111 @@ export default function App() {
       {view === "client" ? (
         <ClientView onSwitch={() => setView("admin")} />
       ) : (
-        <AdminDashboard onSwitch={() => setView("client")} />
+        <AdminGate onSwitch={() => setView("client")} />
       )}
     </ThemeProvider>
   );
+}
+
+function AdminGate({ onSwitch }) {
+  const [status, setStatus] = useState("loading");
+  const [username, setUsername] = useState("admin");
+  const [password, setPassword] = useState("");
+  const [error, setError] = useState("");
+  const [submitting, setSubmitting] = useState(false);
+
+  useEffect(() => {
+    let cancelled = false;
+    fetch("/api/auth/me")
+      .then((r) => r.json())
+      .then((data) => {
+        if (!cancelled) setStatus(data?.authenticated ? "in" : "out");
+      })
+      .catch(() => {
+        if (!cancelled) setStatus("out");
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  async function handleLogin(e) {
+    e.preventDefault();
+    setSubmitting(true);
+    setError("");
+    try {
+      const res = await fetch("/api/auth/login", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ username, password }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        setError(data.error || "Não foi possível entrar");
+        return;
+      }
+      setPassword("");
+      setStatus("in");
+    } catch {
+      setError("Erro de conexão");
+    } finally {
+      setSubmitting(false);
+    }
+  }
+
+  async function handleLogout() {
+    await fetch("/api/auth/logout", { method: "POST" }).catch(() => {});
+    setStatus("out");
+  }
+
+  if (status === "loading") {
+    return (
+      <div className="min-h-screen flex items-center justify-center text-slate-300" style={{ background: "#0f172a" }}>
+        <Loader2 className="w-6 h-6 animate-spin" />
+      </div>
+    );
+  }
+
+  if (status !== "in") {
+    return (
+      <div className="min-h-screen flex items-center justify-center px-4" style={{ background: "#0f172a" }}>
+        <form onSubmit={handleLogin} className="w-full max-w-sm bg-slate-900 border border-slate-800 rounded-2xl p-6 space-y-4">
+          <div>
+            <h1 className="text-white text-xl font-semibold">Painel Reboque Já!</h1>
+            <p className="text-sm text-slate-400 mt-1">Entre para acessar a operação.</p>
+          </div>
+          <label className="block text-sm text-slate-300">
+            Usuário
+            <input
+              value={username}
+              onChange={(e) => setUsername(e.target.value)}
+              autoComplete="username"
+              className="mt-1 w-full bg-slate-800 border border-slate-700 rounded-xl px-3 py-2.5 text-white"
+            />
+          </label>
+          <label className="block text-sm text-slate-300">
+            Senha
+            <input
+              type="password"
+              value={password}
+              onChange={(e) => setPassword(e.target.value)}
+              autoComplete="current-password"
+              className="mt-1 w-full bg-slate-800 border border-slate-700 rounded-xl px-3 py-2.5 text-white"
+            />
+          </label>
+          {error && <p className="text-sm text-red-400">{error}</p>}
+          <button type="submit" disabled={submitting} className="w-full py-3 rounded-xl btn-primary font-medium disabled:opacity-60">
+            {submitting ? "Entrando…" : "Entrar"}
+          </button>
+          <button type="button" onClick={onSwitch} className="w-full text-xs text-slate-500 hover:text-slate-300">
+            Voltar ao chat do cliente
+          </button>
+        </form>
+      </div>
+    );
+  }
+
+  return <AdminDashboard onSwitch={onSwitch} onLogout={handleLogout} />;
 }
 
 // ==================== CLIENT CHAT VIEW ====================
@@ -723,7 +823,7 @@ function ClientView({ onSwitch }) {
 
 // ==================== ADMIN DASHBOARD ====================
 
-function AdminDashboard({ onSwitch }) {
+function AdminDashboard({ onSwitch, onLogout }) {
   const [activeTab, setActiveTab] = useState("dashboard");
   const [stats, setStats] = useState({ total: 0, today: 0, in_progress: 0, completed: 0, recent: [], by_service: [] });
   const [attendances, setAttendances] = useState([]);
@@ -879,6 +979,7 @@ function AdminDashboard({ onSwitch }) {
         sidebarOpen={sidebarOpen}
         onToggleSidebar={() => setSidebarOpen(!sidebarOpen)}
         onSwitchToClient={onSwitch}
+        onLogout={onLogout}
       />
 
       <main className="flex-1 flex flex-col min-w-0 overflow-hidden">
@@ -952,7 +1053,7 @@ function AdminDashboard({ onSwitch }) {
   );
 }
 
-function Sidebar({ tabs, activeTab, onChangeTab, sidebarOpen, onToggleSidebar, onSwitchToClient }) {
+function Sidebar({ tabs, activeTab, onChangeTab, sidebarOpen, onToggleSidebar, onSwitchToClient, onLogout }) {
   const { theme } = useTheme();
   const grouped = useMemo(() => {
     const map = new Map();
@@ -1033,6 +1134,14 @@ function Sidebar({ tabs, activeTab, onChangeTab, sidebarOpen, onToggleSidebar, o
         >
           <MessageCircle className="w-3.5 h-3.5" />
           {sidebarOpen && <span>Ver chat do cliente</span>}
+        </button>
+        <button
+          type="button"
+          onClick={onLogout}
+          className="w-full px-3 py-2 rounded-lg text-xs text-slate-400 hover:text-white hover:bg-slate-800 flex items-center gap-2"
+        >
+          <X className="w-3.5 h-3.5" />
+          {sidebarOpen && <span>Sair</span>}
         </button>
         <button
           type="button"

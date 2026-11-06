@@ -11,7 +11,10 @@ import multer from "multer";
 import { v4 as uuidv4 } from "uuid";
 import { logger } from "./lib/logger.js";
 import axios from "axios";
-import { processMessage, hasLLMConfigured } from "./agents/attendant.js";
+import { processMessage, hasLLMConfigured, getAttendanceFlow } from "./agents/attendant.js";
+import { requireAdmin, loginAdmin, logoutCookie, currentAdmin } from "./lib/adminAuth.js";
+import { isVehicleLookupConfigured } from "./services/vehicleLookup.js";
+import { bootstrapPostgres, pingPostgres } from "./database/pgBootstrap.js";
 import { conversationManager, STATES } from "./agents/conversationFlow.js";
 import { Orchestrator } from "./agents/orchestrator.js";
 import { Analyst } from "./agents/analyst.js";
@@ -51,8 +54,15 @@ const PORT_FALLBACK_MAX = Number.parseInt(String(process.env.PORT_FALLBACK_MAX |
 const EVOLUTION_API_URL = process.env.EVOLUTION_API_URL || "";
 const EVOLUTION_API_KEY = process.env.EVOLUTION_API_KEY || "";
 
-const db = new Database(path.join(__dirname, "attendance.db"));
+const SQLITE_PATH =
+  process.env.SQLITE_PATH?.trim() || path.join(__dirname, "attendance.db");
+try {
+  const dir = path.dirname(SQLITE_PATH);
+  if (dir && dir !== "." && !fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+} catch {}
+const db = new Database(SQLITE_PATH);
 db.pragma("journal_mode = WAL");
+logger.info({ sqlitePath: SQLITE_PATH }, "SQLite aberto");
 
 runSchema();
 runSeed();
@@ -71,8 +81,9 @@ function normalizePhoneList(raw) {
 }
 
 function getTestModeConfig() {
-  const dbVal = (getSetting("test_mode") || "").toLowerCase();
-  const enabled = dbVal === "true" || (dbVal === "" && !process.env.TEST_MODE ? true : process.env.TEST_MODE === "true");
+  const enabled =
+    (getSetting("test_mode") || "").toLowerCase() === "true" ||
+    process.env.TEST_MODE === "true";
   const allowlist = normalizePhoneList(
     getSetting("test_allowlist") || process.env.TEST_ALLOWLIST || ""
   );
@@ -284,6 +295,26 @@ const notificationService = new NotificationService(io, sendEvolutionMessage);
 app.use(cors());
 app.use(express.json({ limit: "10mb" }));
 app.use(express.urlencoded({ extended: true }));
+app.use(requireAdmin);
+
+app.post("/api/auth/login", (req, res) => {
+  const result = loginAdmin(req.body?.username, req.body?.password);
+  if (!result.ok) {
+    const status = result.error?.includes("não configurada") ? 503 : 401;
+    return res.status(status).json({ error: result.error });
+  }
+  res.setHeader("Set-Cookie", result.cookie);
+  res.json({ ok: true, username: result.username });
+});
+
+app.post("/api/auth/logout", (req, res) => {
+  res.setHeader("Set-Cookie", logoutCookie());
+  res.json({ ok: true });
+});
+
+app.get("/api/auth/me", (req, res) => {
+  res.json(currentAdmin(req));
+});
 app.use("/audio", express.static(path.join(__dirname, "audio")));
 app.use("/providers-photos", express.static(path.join(__dirname, "providers-photos")));
 
@@ -614,6 +645,35 @@ app.get("/", (req, res) => {
   } else {
     res.sendFile(path.join(__dirname, "index.html"));
   }
+});
+
+app.get("/api/health", async (req, res) => {
+  const health = {
+    ok: true,
+    service: "reboque-ja",
+    uptime_s: Math.round(process.uptime()),
+    attendance_flow: getAttendanceFlow(),
+    sqlite: { path: SQLITE_PATH, ok: true },
+    postgres: { configured: true, ok: false },
+    vehicle_lookup: isVehicleLookupConfigured(),
+    whatsapp: { evolution_configured: !!(EVOLUTION_API_URL && EVOLUTION_API_KEY) },
+  };
+  try {
+    db.prepare("SELECT 1").get();
+  } catch (err) {
+    health.ok = false;
+    health.sqlite = { path: SQLITE_PATH, ok: false, error: String(err?.message || err) };
+  }
+  try {
+    const pg = await pingPostgres();
+    health.postgres.ok = !!pg.ok;
+  } catch (err) {
+    health.postgres.ok = false;
+    health.postgres.error = String(err?.message || err);
+    // Postgres é alvo de M3; falha não derruba o piloto enquanto o app ainda usa SQLite.
+  }
+  const status = health.ok ? 200 : 503;
+  res.status(status).json(health);
 });
 
 app.get("/api/settings", (req, res) => {
@@ -2346,7 +2406,21 @@ function bindServer(port) {
     } else {
       logger.info(`  Agente Atendente: ${hasLLMConfigured() ? "Ativo (LLM)" : "Desativado (configure credenciais LLM)"}`);
     }
+    logger.info(`  Fluxo coleta: ${getAttendanceFlow()} (ATTENDANCE_FLOW=brief|full)`);
+    logger.info(
+      `  Placa/veículo: ${isVehicleLookupConfigured() ? "API Brasil configurada" : "desligado (APIBRASIL_TOKEN ou APIBRASIL_HOMOLOG)"}`
+    );
+    logger.info(`  SQLite: ${SQLITE_PATH}`);
     logger.info(`========================================`);
+
+    bootstrapPostgres()
+      .then((r) => {
+        if (r?.ok) logger.info("PostgreSQL pronto (schema verificado — corte completo do app = M3b)");
+        else logger.warn({ err: r?.error }, "PostgreSQL indisponível no boot (app segue em SQLite)");
+      })
+      .catch((err) => {
+        logger.warn({ err: err?.message }, "PostgreSQL indisponível no boot (app segue em SQLite)");
+      });
   });
 }
 
